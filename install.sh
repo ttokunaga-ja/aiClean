@@ -1,5 +1,5 @@
 #!/bin/sh
-# Intended public entry point; available only after the repository and release are published.
+# Install the latest stable public release.
 # curl -fsSL https://raw.githubusercontent.com/ttokunaga-ja/aiClean/main/install.sh | sh
 set -eu
 if [ "$(uname -s)" != Darwin ]; then

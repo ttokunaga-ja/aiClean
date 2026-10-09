@@ -2,6 +2,28 @@
 
 Local Claude Code and Codex storage cleanup. No CLI account or login is required.
 
+## Install
+
+macOS (Apple Silicon / Intel universal):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ttokunaga-ja/aiClean/main/install.sh | sh
+```
+
+Windows x64 (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/ttokunaga-ja/aiClean/main/install.ps1 | iex
+```
+
+Installers verify the release SHA-256 and executable version before replacement. Installation does not enable cleanup. Open a new terminal after installation, then use `aiClean check claude codex` to inspect candidates and `aiClean status claude codex` to check OS settings. Enable monthly cleanup explicitly with `aiClean enable claude codex`.
+
+```sh
+aiClean --version
+aiClean update
+aiClean uninstall
+```
+
 ## Command contract
 
 `aiClean check claude codex` is read-only and shows candidates, skipped sessions, source bytes, and recoverable Trash bytes. `plan` is not an alias.
@@ -37,7 +59,7 @@ The maintenance lock covers run/undo/scheduler mutations. Immutable per-session 
 
 Claude backend targets local Claude Code projects, not cloud history or account switching. Shared ~/.claude/history.jsonl prompt history is preserved; it is not used as a session registration index. Both providers respect CODEX_HOME / CLAUDE_CONFIG_DIR. Receipts/config default to ~/.aiClean, outside provider data.
 Mac native Trash and launchd; Windows native Recycle Bin and per-user Task Scheduler. Linux/WSL are not treated as Windows.
-Installer and release automation are implemented locally; public repository creation and releases are separate publishing operations. Until release, install from the local release build. Installer URLs become usable only after publication.
+Stable releases include a macOS universal binary, a Windows x64 binary, and SHA256SUMS. Version tags trigger tested builds and release publication on GitHub Actions. macOS binaries are ad-hoc signed, not Apple notarized; Windows binaries are not Authenticode signed. Managed security policies may require additional approval. Source and release artifacts are available at https://github.com/ttokunaga-ja/aiClean.
 
 Build locally with `cargo build --release --locked`; the executable is `target/release/aiClean` (`aiClean.exe` on Windows). Install to a stable absolute location before `enable`, because scheduled tasks record that executable path. `--state-dir PATH` / `AICLEAN_STATE_DIR` selects independent recovery storage and must not overlap either provider root. Keep the recovery state when moving or updating the binary.
 

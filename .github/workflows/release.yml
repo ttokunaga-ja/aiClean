@@ -25,6 +25,12 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      - name: Isolated macOS installer fixtures
+        if: runner.os == 'macOS'
+        run: sh tests/installer.sh
+      - name: Isolated Windows installer fixtures
+        if: runner.os == 'Windows'
+        run: ./tests/installer.ps1
       - name: Build macOS universal binary
         if: runner.os == 'macOS'
         run: |
