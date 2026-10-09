@@ -1,0 +1,66 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || 'x86_64-pc-windows-msvc' }}
+      - name: Verify exact stable version tag
+        shell: bash
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          test "${GITHUB_REF_NAME#v}" = "$(cargo pkgid --locked | sed 's/.*[#@]//')"
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - name: Build macOS universal binary
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir dist
+          lipo -create -output dist/aiClean-macos target/aarch64-apple-darwin/release/aiClean target/x86_64-apple-darwin/release/aiClean
+          codesign --force --sign - dist/aiClean-macos
+          test "$(dist/aiClean-macos --version)" = "aiClean ${GITHUB_REF_NAME#v}"
+      - name: Build Windows x64 binary
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cargo build --release --locked --target x86_64-pc-windows-msvc
+          mkdir dist
+          cp target/x86_64-pc-windows-msvc/release/aiClean.exe dist/aiClean-windows-x64.exe
+          test "$(dist/aiClean-windows-x64.exe --version | tr -d '\r')" = "aiClean ${GITHUB_REF_NAME#v}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ runner.os }}
+          path: dist/*
+          if-no-files-found: error
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create checksum manifest
+        working-directory: dist
+        run: sha256sum aiClean-macos aiClean-windows-x64.exe > SHA256SUMS
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/aiClean-macos dist/aiClean-windows-x64.exe dist/SHA256SUMS --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
