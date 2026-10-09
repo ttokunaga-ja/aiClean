@@ -26,6 +26,8 @@ aiClean uninstall
 
 ## Command contract
 
+All public output is human-readable Japanese; there is no `--json` option. `check` lists every validated candidate with its saved title (or first genuine user text, then ID), actual last-message date in local time, source-file size and ID. Titles are terminal-safe Unicode excerpts; title metadata never affects retention. Candidate counts and source bytes are shown separately for Claude and Codex. Source bytes are not guaranteed freed disk space. `status` distinguishes enabled, disabled and unknown task states and reports next occurrence, last attempt/result, pending recovery and the verified 30-day OS purge policy. Diagnostics preserve low-level details as plain text. Cancelled operations never claim completion.
+
 `aiClean check claude codex` is read-only and shows candidates, skipped sessions, source bytes, and recoverable Trash bytes. `plan` is not an alias.
 `run claude codex` performs monthly cleanup on or after the 10th, at most once per successful month/provider. Providers are explicit, order-independent, duplicates rejected.
 `enable claude codex`, `stop claude codex`, and `status claude codex` control and inspect per-provider user scheduled tasks. `stop` persistently disables future runs and signals a current cleanup to stop before its next session, while allowing the current durable step to finish. No process is forcibly killed.

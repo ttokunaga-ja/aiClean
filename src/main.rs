@@ -1,3 +1,4 @@
+mod human;
 use ai_clean::{
     model::{Inventory, Provider, Roots, Session, validate_providers},
     platform, providers, schedule, storage,
@@ -15,18 +16,17 @@ use std::{
 #[command(
     name = "aiClean",
     version,
-    about = "Recoverable cleanup of local AI conversation logs; no account or login required"
+    help_template = "{about}\n\n使い方: {usage}\n\n{all-args}",
+    about = "Claude / Codex の会話ログを復元可能な形で整理します"
 )]
 struct Cli {
     #[arg(
         long,
         global = true,
         env = "AICLEAN_STATE_DIR",
-        help = "Receipts and scheduler state (default ~/.aiClean)"
+        help = "復元記録・自動実行設定の保存先（既定 ~/.aiClean）"
     )]
     state_dir: Option<PathBuf>,
-    #[arg(long, global = true, help = "Machine-readable JSON output")]
-    json: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -37,31 +37,31 @@ struct Targets {
 }
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Read-only check of eligible sessions and capacity.
+    /// 候補と容量を読み取り専用で確認します。
     Check(Targets),
-    /// Move eligible sessions to OS Trash once per successful month after day 10.
+    /// 10日以降、月1回の整理を実行します。
     Run {
         #[arg(value_enum, required=true, num_args=1..)]
         providers: Vec<Provider>,
         #[arg(long, hide = true)]
         scheduled: bool,
     },
-    /// Register monthly day-10 03:30 tasks; no immediate cleanup.
+    /// 毎月10日03:30の自動実行を有効にします。
     Enable(Targets),
-    /// Persistently disable automatic runs; current work stops between sessions.
+    /// 自動実行を無効にし、進行中の整理に停止を要求します。
     Stop(Targets),
-    /// Show actual task configuration, last result and recovery state.
+    /// 自動実行・前回結果・復元状態を表示します。
     Status(Targets),
-    /// Restore each provider's latest unrestored batch.
+    /// 最新の未復元バッチを復元します。
     Undo {
         #[arg(value_enum, required=true, num_args=1..)]
         providers: Vec<Provider>,
         #[arg(long)]
         batch: Option<String>,
     },
-    /// Install a checksum-verified official release when available.
+    /// 公式リリースを検証して更新します。
     Update,
-    /// Remove this CLI and its tasks; keep sessions and recovery records.
+    /// CLIと自動実行を削除します（会話と復元記録は保持）。
     Uninstall,
 }
 fn state_path(cli: &Cli) -> Result<PathBuf> {
@@ -166,11 +166,11 @@ fn execute(cli: &Cli) -> Result<(Value, bool)> {
         Commands::Undo { providers, batch } => (providers, batch.as_deref()),
         Commands::Update => {
             ai_clean::update::run()?;
-            return Ok((json!({"command":"update","success":true}), false));
+            return Ok((json!({"results":[]}), false));
         }
         Commands::Uninstall => {
             ai_clean::uninstall::run(&state)?;
-            return Ok((json!({"command":"uninstall","success":true}), false));
+            return Ok((json!({"results":[]}), false));
         }
     };
     validate_providers(targets)?;
@@ -184,8 +184,9 @@ fn execute(cli: &Cli) -> Result<(Value, bool)> {
                 Commands::Check(_) => {
                     let inventory = providers::inventory(p, &roots)?;
                     let (sessions, skipped) = select(&inventory, boundary);
+                    let candidates = sessions.iter().map(|s| { let (title, diagnostics) = providers::display_title(s); Ok(json!({"id":s.id,"title":title,"title_diagnostic":if diagnostics.is_empty(){None}else{Some(diagnostics.join("; "))},"last_message_ms":s.last_message_ms,"bytes":log_bytes(std::slice::from_ref(s))?})) }).collect::<Result<Vec<Value>>>()?;
                     Ok(
-                        json!({"provider":p,"command":"check","read_only":true,"candidate_count":sessions.len(),"candidate_log_bytes":log_bytes(&sessions)?,"skipped_by_reason":skipped,"warnings":inventory.warnings,"database":database_capacity(roots.get(p))?,"recovery":storage::status(&roots,&state,p)?,"mutation_available":platform::ensure_quiet(p).is_ok(),"trash_purge":platform::purge_status()?}),
+                        json!({"provider":p,"command":"check","read_only":true,"candidates":candidates,"candidate_count":sessions.len(),"candidate_log_bytes":log_bytes(&sessions)?,"skipped_by_reason":skipped,"warnings":inventory.warnings,"database":database_capacity(roots.get(p))?,"recovery":storage::status(&roots,&state,p)?,"mutation_block_reason":platform::ensure_quiet(p).err().map(|e|format!("{e:#}")),"trash_purge":platform::purge_status()?}),
                     )
                 }
                 Commands::Run { scheduled, .. } => {
@@ -212,7 +213,7 @@ fn execute(cli: &Cli) -> Result<(Value, bool)> {
                 Commands::Enable(_) => schedule::enable(&state, p),
                 Commands::Stop(_) => schedule::stop(&state, p),
                 Commands::Status(_) => Ok(
-                    json!({"provider":p,"command":"status","schedule":schedule::status(&state,p)?,"storage":storage::status(&roots,&state,p)?,"trash_purge":platform::purge_status()?,"mutation_available":platform::ensure_quiet(p).is_ok(),"state_dir":state}),
+                    json!({"provider":p,"command":"status","schedule":schedule::status(&state,p)?,"storage":storage::status(&roots,&state,p)?,"trash_purge":platform::purge_status()?,"mutation_block_reason":platform::ensure_quiet(p).err().map(|e|format!("{e:#}")),"state_dir":state}),
                 ),
                 Commands::Undo { .. } => storage::undo(&roots, &state, p, batch),
                 _ => unreachable!(),
@@ -220,7 +221,19 @@ fn execute(cli: &Cli) -> Result<(Value, bool)> {
         })();
         let mut value = match result {
             Ok(v) => v,
-            Err(e) => json!({"provider":p,"success":false,"error":format!("{e:#}")}),
+            Err(e) => {
+                let mut error = json!({"provider":p,"success":false,"error":format!("{e:#}")});
+                if matches!(cli.command, Commands::Run { .. } | Commands::Undo { .. }) {
+                    match storage::status(&roots, &state, p) {
+                        Ok(s) => error["recovery_after_failure"] = s,
+                        Err(e) => {
+                            error["recovery_diagnostic"] =
+                                json!(format!("復元状態を確認できません: {e:#}"))
+                        }
+                    }
+                }
+                error
+            }
         };
         if matches!(cli.command, Commands::Run { .. } | Commands::Undo { .. }) {
             value["command"] = json!(if matches!(cli.command, Commands::Run { .. }) {
@@ -237,6 +250,14 @@ fn execute(cli: &Cli) -> Result<(Value, bool)> {
         if value["success"] == false || value["stopped"] == true {
             failed = true;
         }
+        if value["command"].is_null() {
+            value["command"] = json!(match &cli.command {
+                Commands::Enable(_) => "enable",
+                Commands::Stop(_) => "stop",
+                Commands::Status(_) => "status",
+                _ => "check",
+            });
+        }
         results.push(value);
     }
     Ok((
@@ -245,24 +266,40 @@ fn execute(cli: &Cli) -> Result<(Value, bool)> {
     ))
 }
 fn main() {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            if matches!(
+                e.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) {
+                print!("{e}");
+                std::process::exit(0);
+            }
+            eprintln!(
+                "引数が不正です。aiClean --help で使い方を確認してください。\n診断: {}",
+                human::safe(&e.to_string(), 4000)
+            );
+            std::process::exit(2);
+        }
+    };
     match execute(&cli) {
         Ok((result, failed)) => {
-            if cli.json {
-                println!("{result}");
-            } else {
-                println!("{}", serde_json::to_string_pretty(&result).unwrap());
-            }
+            print!("{}", human::render(&result));
             if failed {
                 std::process::exit(1);
             }
         }
         Err(e) => {
-            eprintln!("{}", json!({"success":false,"error":format!("{e:#}")}));
+            eprintln!(
+                "処理に失敗しました。\n診断: {}",
+                human::safe(&format!("{e:#}"), 4000)
+            );
             std::process::exit(2);
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

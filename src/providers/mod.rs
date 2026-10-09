@@ -3,6 +3,8 @@ use anyhow::Result;
 mod claude;
 mod codex;
 mod common;
+mod display;
+pub use display::{terminal_safe, title as display_title};
 pub fn inventory(provider: Provider, roots: &Roots) -> Result<Inventory> {
     let mut inventory = match provider {
         Provider::Claude => claude::inventory(roots.get(provider))?,

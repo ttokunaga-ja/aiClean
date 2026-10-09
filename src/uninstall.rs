@@ -29,10 +29,13 @@ pub fn run(state: &Path) -> Result<()> {
     let original = fingerprint(&executable)?;
     #[cfg(unix)]
     let original_identity = identity(&executable)?;
-    eprintln!("aiClean executable: {}", executable.display());
     eprintln!(
-        "aiClean tasks for state {} will be stopped and unregistered. All sessions, cleanup receipts, and restore bundles are preserved.",
-        state.display()
+        "aiClean 実行ファイル: {}",
+        crate::providers::terminal_safe(&executable.to_string_lossy(), 4000)
+    );
+    eprintln!(
+        "状態保存先 {} のaiClean自動実行を停止・解除します。会話、整理記録、復元バンドルは保持します。",
+        crate::providers::terminal_safe(&state.to_string_lossy(), 4000)
     );
     eprint!("この実行ファイルを削除しますか？ [y/N]: ");
     io::stderr().flush()?;
@@ -70,7 +73,10 @@ pub fn run(state: &Path) -> Result<()> {
             #[cfg(not(windows))]
             {
                 fs::remove_file(&executable).context("実行ファイルを削除できません")?;
-                eprintln!("実行ファイルを削除しました: {}", executable.display());
+                eprintln!(
+                    "実行ファイルを削除しました: {}",
+                    crate::providers::terminal_safe(&executable.to_string_lossy(), 4000)
+                );
                 Ok(())
             }
         },
@@ -508,9 +514,12 @@ try {
         );
         eprintln!(
             "結果の記録: {}（status: scheduled / deleted / failed）",
-            kept.join("receipt.json").display()
+            crate::providers::terminal_safe(&kept.join("receipt.json").to_string_lossy(), 4000)
         );
-        eprintln!("失敗時に手動削除する退避ファイル: {}", staged.display());
+        eprintln!(
+            "失敗時に手動削除する退避ファイル: {}",
+            crate::providers::terminal_safe(&staged.to_string_lossy(), 4000)
+        );
         Ok(())
     }
 }

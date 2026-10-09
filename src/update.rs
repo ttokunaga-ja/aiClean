@@ -86,7 +86,10 @@ fn update(
         bail!("Installed executable changed during update; replacement cancelled");
     }
     replace(exe, &staged)?;
-    println!("{tag} に更新しました: {}", exe.display());
+    println!(
+        "{tag} に更新しました: {}",
+        crate::providers::terminal_safe(&exe.to_string_lossy(), 4000)
+    );
     Ok(true)
 }
 
