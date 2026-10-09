@@ -29,6 +29,10 @@ pub(crate) fn run_command(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    // Windows helpers use PowerShell 5.1. A PowerShell 7 -> Rust -> helper launch can
+    // inherit incompatible Core modules; let the child construct its native module path.
+    #[cfg(target_os = "windows")]
+    command.env_remove("PSModulePath");
     let mut child = command.spawn().context("OS helper could not start")?;
     let stdout = child.stdout.take().context("OS helper pipe unavailable")?;
     // Drain in parallel so a large process inventory cannot block the child. Limit retained output.
@@ -365,6 +369,8 @@ pub fn ensure_single_link(path: &Path) -> Result<()> {
     bail!("Source link count cannot be verified on this OS");
     Ok(())
 }
+#[cfg(target_os = "windows")]
+const WINDOWS_PRIVATE_DIRECTORY_ACL: &str = r#"$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User; $acl=New-Object Security.AccessControl.DirectorySecurity; $acl.SetOwner($sid); $acl.SetAccessRuleProtection($true,$false); foreach($principal in @($sid,(New-Object Security.Principal.SecurityIdentifier('S-1-5-18')))){$rule=New-Object Security.AccessControl.FileSystemAccessRule($principal,'FullControl','ContainerInherit,ObjectInherit','None','Allow');$acl.AddAccessRule($rule)}; Set-Acl -LiteralPath $env:AICLEAN_PRIVATE_DIR -AclObject $acl"#;
 /// Establish privacy for an aiClean-owned directory before writing raw conversation data.
 pub fn ensure_private_directory(path: &Path) -> Result<()> {
     crate::schedule::safe_path(path)?;
@@ -380,7 +386,7 @@ pub fn ensure_private_directory(path: &Path) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         let result = powershell(
-            r#"$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User; $acl=New-Object Security.AccessControl.DirectorySecurity; $acl.SetOwner($sid); $acl.SetAccessRuleProtection($true,$false); foreach($principal in @($sid,(New-Object Security.Principal.SecurityIdentifier('S-1-5-18')))){$rule=New-Object Security.AccessControl.FileSystemAccessRule($principal,'FullControl','ContainerInherit,ObjectInherit','None','Allow');$acl.AddAccessRule($rule)}; Set-Acl -LiteralPath $env:AICLEAN_PRIVATE_DIR -AclObject $acl"#,
+            WINDOWS_PRIVATE_DIRECTORY_ACL,
             &[("AICLEAN_PRIVATE_DIR".into(), path.as_os_str().to_owned())],
         )?;
         if !result.success {
@@ -790,6 +796,46 @@ if(Test-Path -LiteralPath $root){ foreach($i in @(Get-ChildItem -LiteralPath $ro
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn native_helper_persists_private_acl_under_inherited_shell_environment() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        // CI runs Cargo from PowerShell 7: the intermediate Rust process inherits its
+        // module path unchanged. Run this same native boundary under either shell.
+        let output = powershell(
+            "$command=Get-Command Set-Acl -ErrorAction Stop; if($command.CommandType -ne 'Cmdlet'){throw 'Native Security cmdlet missing'}; 'native-security-cmdlet'",
+            &[],
+        ).unwrap();
+        assert!(
+            output.success,
+            "Native Security cmdlet must resolve under the inherited shell environment; exit {:?}",
+            output.code
+        );
+        assert_eq!(output.stdout.trim(), "native-security-cmdlet");
+        let private = root.join("owned-private-fixture");
+        fs::create_dir(&private).unwrap();
+        ensure_private_directory(&private).unwrap();
+        let script = r#"$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User;
+$stored=Get-Acl -LiteralPath $env:AICLEAN_PRIVATE_DIR;
+if(-not $stored.AreAccessRulesProtected -or $stored.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value){throw 'Protected fixture ownership missing'}
+$rules=@($stored.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]));
+if($rules.Count -ne 2){throw 'Unexpected fixture access rules'}
+foreach($rule in $rules){if($rule.IsInherited -or $rule.IdentityReference.Value -notin @($sid.Value,'S-1-5-18') -or $rule.AccessControlType -ne 'Allow' -or [int]$rule.FileSystemRights -ne [int][Security.AccessControl.FileSystemRights]::FullControl -or [int]$rule.InheritanceFlags -ne 3){throw 'Unsafe fixture access rule'}}
+'private-protected-acl'
+"#;
+        let output = powershell(
+            script,
+            &[("AICLEAN_PRIVATE_DIR".into(), private.into_os_string())],
+        )
+        .unwrap();
+        assert!(
+            output.success,
+            "Protected private fixture ACL must persist despite inherited module paths; exit {:?}",
+            output.code
+        );
+        assert_eq!(output.stdout.trim(), "private-protected-acl");
+    }
     fn windows_fixture_receipt_original(bytes: &[u8]) -> Result<String> {
         if bytes.len() < 28 || bytes.len() > 65564 {
             bail!("Unsafe native receipt size");
