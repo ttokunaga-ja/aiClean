@@ -1,4 +1,4 @@
-# irm https://raw.githubusercontent.com/ttokunaga-ja/aiClean/main/install.ps1 | iex
+﻿# irm https://raw.githubusercontent.com/ttokunaga-ja/aiClean/main/install.ps1 | iex
 # BIN_DIR overrides the destination. AICLEAN_INSTALL_NO_PATH=1 is for isolated tests.
 # Keep this scoped and never call exit: iex runs inside the user's PowerShell.
 & {
@@ -59,7 +59,7 @@
         $metadata = Join-Path $temp 'release.json'
         try { Fetch 'https://api.github.com/repos/ttokunaga-ja/aiClean/releases/latest' $metadata }
         catch { throw "No published aiClean release could be retrieved. Build the local source with cargo build --release --locked. $($_.Exception.Message)" }
-        $release = Get-Content -LiteralPath $metadata -Raw | ConvertFrom-Json
+        $release = Get-Content -LiteralPath $metadata -Raw -Encoding UTF8 | ConvertFrom-Json
         $tag = [string]$release.tag_name
         if ($tag -cnotmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or $release.draft -or $release.prerelease) { throw 'Expected a published stable vX.Y.Z release' }
         $base = "https://github.com/ttokunaga-ja/aiClean/releases/download/$tag"
@@ -71,7 +71,7 @@
         function Get-ExpectedHash([string]$manifest, [string]$asset) {
             $seen = @{}
             $expected = $null
-            foreach ($line in Get-Content -LiteralPath $manifest) {
+            foreach ($line in Get-Content -LiteralPath $manifest -Encoding UTF8) {
                 if ($line -cnotmatch '^([0-9a-fA-F]{64}) [ *]([^\s/\\]+)$') { throw 'Malformed SHA256SUMS entry' }
                 $digest = $Matches[1]; $name = $Matches[2]
                 if ($seen.ContainsKey($name)) { throw 'Duplicate SHA256SUMS entry' }

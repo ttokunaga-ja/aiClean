@@ -44,6 +44,12 @@ pub(crate) fn safe_path(path: &Path) -> Result<()> {
             bail!("Parent traversal refused");
         }
         current.push(part);
+        // A Windows prefix (for example \\?\C:) is not itself an absolute root.
+        // Querying it before RootDir is appended can fail with ERROR_INVALID_FUNCTION.
+        // The absolute-path check above ensures its root is validated on the next component.
+        if matches!(part, Component::Prefix(_)) {
+            continue;
+        }
         match fs::symlink_metadata(&current) {
             Ok(m) => {
                 if m.file_type().is_symlink() {
@@ -151,7 +157,7 @@ fn windows_spec(c: &TaskConfig, sid: &str, start_boundary: &str) -> Result<Strin
         windows_quote(path_text(&wrapper)?)
     );
     Ok(format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><RegistrationInfo><Description>aiClean recoverable monthly {}</Description></RegistrationInfo><Triggers><CalendarTrigger><StartBoundary>{}</StartBoundary><Enabled>true</Enabled><ScheduleByMonth><DaysOfMonth><Day>10</Day></DaysOfMonth><Months><January/><February/><March/><April/><May/><June/><July/><August/><September/><October/><November/><December/></Months></ScheduleByMonth></CalendarTrigger></Triggers><Principals><Principal id="CurrentUser"><UserId>{}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><Enabled>{}</Enabled><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><AllowHardTerminate>false</AllowHardTerminate></Settings><Actions Context="CurrentUser"><Exec><Command>{}</Command><Arguments>{}</Arguments></Exec></Actions></Task>"#,
+        r#"<?xml version="1.0"?><Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><RegistrationInfo><Description>aiClean recoverable monthly {}</Description></RegistrationInfo><Triggers><CalendarTrigger><StartBoundary>{}</StartBoundary><Enabled>true</Enabled><ScheduleByMonth><DaysOfMonth><Day>10</Day></DaysOfMonth><Months><January/><February/><March/><April/><May/><June/><July/><August/><September/><October/><November/><December/></Months></ScheduleByMonth></CalendarTrigger></Triggers><Principals><Principal id="CurrentUser"><UserId>{}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><Enabled>{}</Enabled><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><AllowHardTerminate>false</AllowHardTerminate></Settings><Actions Context="CurrentUser"><Exec><Command>{}</Command><Arguments>{}</Arguments></Exec></Actions></Task>"#,
         c.provider.name(),
         xml(start_boundary)?,
         xml(sid)?,
@@ -744,6 +750,118 @@ fn windows_status(p: Provider) -> Result<Value> {
 mod tests {
     use super::*;
     #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "Native Task Scheduler fixture, explicitly creates and removes only a unique no-run test task"]
+    fn native_windows_task_xml_roundtrip_without_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture_state = temp.path().join("fixture state 日本語");
+        fs::create_dir(&fixture_state).unwrap();
+        let state = fixture_state.canonicalize().unwrap();
+        let config = TaskConfig {
+            provider: Provider::Codex,
+            executable: std::env::current_exe().unwrap(),
+            state: state.clone(),
+            environment: Default::default(),
+            enabled: true,
+        };
+        let sid = crate::platform::powershell(
+            "[Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+            &[],
+        )
+        .unwrap();
+        assert!(sid.success);
+        let sid = sid.stdout.trim();
+        assert!(sid.starts_with("S-1-"));
+        // No cleanup action is available even if a host clock is unexpectedly advanced.
+        let wrapper = state.join("schedule").join("codex.ps1");
+        private_write(&wrapper, b"exit 0\r\n").unwrap();
+        let spec = state.join("fixture.xml");
+        private_write(
+            &spec,
+            windows_spec(&config, sid, "2100-01-10T03:30:00")
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        let task_name = format!("local.aiClean.fixture.{}", uuid::Uuid::new_v4());
+        eprintln!("aiClean native Task Scheduler fixture task: {task_name}");
+        let result = crate::platform::powershell(
+            NATIVE_TASK_FIXTURE,
+            &[
+                ("AICLEAN_TASK_NAME".into(), task_name.into()),
+                ("AICLEAN_TASK_XML".into(), spec.into_os_string()),
+                ("AICLEAN_FIXTURE_SID".into(), sid.into()),
+                ("AICLEAN_FIXTURE_WRAPPER".into(), wrapper.into_os_string()),
+            ],
+        )
+        .unwrap();
+        assert!(
+            result.success,
+            "Native Task Scheduler fixture failed: {}",
+            result.stdout
+        );
+        let report: Value = serde_json::from_str(result.stdout.trim()).unwrap();
+        assert_eq!(report["success"], true);
+        assert_eq!(report["removed"], true);
+        assert_eq!(report["never_run"], true);
+    }
+    #[cfg(target_os = "windows")]
+    const NATIVE_TASK_FIXTURE: &str = r#"
+$name=$env:AICLEAN_TASK_NAME; $sid=$env:AICLEAN_FIXTURE_SID;
+if($name -notmatch '^local\.aiClean\.fixture\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'){throw 'Invalid fixture task name'}
+[xml]$expected=Get-Content -LiteralPath $env:AICLEAN_TASK_XML -Encoding UTF8 -Raw;
+$exec=$expected.Task.Actions.Exec; $expectedCommand=[string]$exec.Command; $expectedArgs=[string]$exec.Arguments;
+if([datetime]$expected.Task.Triggers.CalendarTrigger.StartBoundary -le [datetime]::Now.AddYears(1)){throw 'Fixture boundary is not safely in future'}
+function Get-FixtureTask {
+  try { Get-ScheduledTask -TaskName $name -TaskPath '\' -ErrorAction Stop }
+  catch { if($_.FullyQualifiedErrorId -notlike 'CmdletizationQuery_NotFound*'){throw} }
+}
+function Get-OwnedFixtureTask {
+  $t=Get-FixtureTask; if($null -eq $t){throw 'Fixture task missing'}
+  if($t.TaskName -cne $name -or $t.TaskPath -cne '\' -or @($t.Actions).Count -ne 1 -or $t.Actions[0].Execute -cne $expectedCommand -or $t.Actions[0].Arguments -cne $expectedArgs){throw 'Fixture action ownership mismatch'}
+  $user=[string]$t.Principal.UserId;
+  if($user -notlike 'S-1-*'){$user=(New-Object Security.Principal.NTAccount($user)).Translate([Security.Principal.SecurityIdentifier]).Value}
+  if($user -cne $sid){throw 'Fixture principal ownership mismatch'}
+  if([string]$t.State -eq 'Running'){throw 'Fixture unexpectedly running'}
+  $info=Get-ScheduledTaskInfo -InputObject $t;
+  if($info.LastRunTime.Year -ge 2000){throw 'Fixture unexpectedly ran'}
+  return $t
+}
+$created=$false; $removed=$false; $failure=$null; $message=$null; $hresult=$null; $settings=$null; $stage='collision check';
+try {
+  if($null -ne (Get-FixtureTask)){throw 'Fixture task collision'}
+  $stage='invoke harmless fixture wrapper'; & $expectedCommand -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $env:AICLEAN_FIXTURE_WRAPPER 2>$null; if($LASTEXITCODE -ne 0){throw 'Harmless fixture wrapper invocation failed'}
+  $stage='register generated XML'; Register-ScheduledTask -TaskName $name -TaskPath '\' -Xml $expected.OuterXml | Out-Null; $created=$true;
+  $stage='export schema and principal'; $t=Get-OwnedFixtureTask;
+  [xml]$actual=Export-ScheduledTask -TaskName $name -TaskPath '\';
+  $settings=@{logon_type=[string]$actual.Task.Principals.Principal.LogonType;run_level=[string]$actual.Task.Principals.Principal.RunLevel;cim_run_level=[string]$t.Principal.RunLevel;execution_time_limit=[string]$actual.Task.Settings.ExecutionTimeLimit;allow_hard_terminate=[string]$actual.Task.Settings.AllowHardTerminate;start_when_available=[string]$actual.Task.Settings.StartWhenAvailable};
+  foreach($key in @($settings.Keys)){if($settings[$key].Length -gt 128){$settings[$key]=$settings[$key].Substring(0,128)}}
+  $trigger=$actual.Task.Triggers.CalendarTrigger;
+  if(@($actual.Task.Triggers.ChildNodes).Count -ne 1 -or $null -eq $trigger -or [datetime]$trigger.StartBoundary -le [datetime]::Now.AddYears(1) -or [string]$trigger.ScheduleByMonth.DaysOfMonth.Day -ne '10' -or @($trigger.ScheduleByMonth.Months.ChildNodes).Count -ne 12){throw 'Fixture calendar schema mismatch'}
+  $xmlRunLevel=[string]$actual.Task.Principals.Principal.RunLevel;
+  if($null -eq $t.Principal.RunLevel -or [int]$t.Principal.RunLevel -ne 0 -or ($xmlRunLevel -ne '' -and $xmlRunLevel -ne 'LeastPrivilege')){throw 'Fixture least privilege mismatch'}
+  if([string]$actual.Task.Principals.Principal.LogonType -ne 'InteractiveToken' -or [string]$actual.Task.Settings.ExecutionTimeLimit -ne 'PT0S' -or [string]$actual.Task.Settings.AllowHardTerminate -ne 'false' -or [string]$actual.Task.Settings.StartWhenAvailable -ne 'true'){throw 'Fixture settings schema mismatch'}
+  $stage='disable'; Disable-ScheduledTask -InputObject $t | Out-Null; $t=Get-OwnedFixtureTask; if($t.Settings.Enabled){throw 'Disable was not persistent'}
+  $stage='enable'; Enable-ScheduledTask -InputObject $t | Out-Null; $t=Get-OwnedFixtureTask; if(-not $t.Settings.Enabled){throw 'Enable was not persistent'}
+} catch {$failure=$stage; $message=[string]$_.Exception.Message; if($message.Length -gt 1024){$message=$message.Substring(0,1024)}; $hresult=$_.Exception.HResult}
+finally {
+  if($created){try {$t=Get-OwnedFixtureTask; Unregister-ScheduledTask -InputObject $t -Confirm:$false; if($null -ne (Get-FixtureTask)){throw 'Fixture still registered'}; $removed=$true} catch {$failure='owned fixture cleanup'; $message=[string]$_.Exception.Message; if($message.Length -gt 1024){$message=$message.Substring(0,1024)}; $hresult=$_.Exception.HResult}}
+}
+@{success=($null -eq $failure);failed_stage=$failure;exception_message=$message;exception_hresult=$hresult;actual_settings=$settings;removed=$removed;never_run=($null -eq $failure)} | ConvertTo-Json -Compress;
+if($null -ne $failure){exit 1}
+"#;
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn canonical_verbatim_root_is_validated_as_an_absolute_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        assert!(
+            matches!(root.components().next(),Some(Component::Prefix(prefix)) if prefix.kind().is_verbatim())
+        );
+        safe_path(&root).unwrap();
+        safe_path(&root.join("not-created-yet").join("receipt.json")).unwrap();
+    }
+    #[test]
     fn windows_wrapper_reads_utf8_config_as_data() {
         assert!(WINDOWS_WRAPPER.contains("-Encoding UTF8 -Raw | ConvertFrom-Json"));
         assert!(WINDOWS_WRAPPER.contains("run --scheduled $config.provider"));
@@ -952,6 +1070,9 @@ mod tests {
             enabled: true,
         };
         let xml = windows_spec(&spec, "S-1-5-21-test", "2026-10-10T03:30:00").unwrap();
+        // Registration consumes a Unicode COM BSTR even when our file is UTF-8.
+        assert!(xml.starts_with("<?xml version=\"1.0\"?>"));
+        assert!(!xml.contains("encoding="));
         assert!(xml.contains("<Day>10</Day>"));
         assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
         assert!(!xml.contains("LogonTrigger"));

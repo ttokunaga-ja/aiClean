@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'install.ps1'), [ref]$tokens, [ref]$errors)
-if ($errors.Count) { throw ($errors | Out-String) }
+if ($errors.Count) { throw (($errors | ForEach-Object { 'Line ' + $_.Extent.StartLineNumber + ': ' + $_.Message }) -join "`n") }
 foreach ($name in @('Get-ExpectedHash', 'Confirm-Version', 'Install-Staged')) {
     $definition = $ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name}, $true)
     if (-not $definition) { throw "Missing helper $name" }

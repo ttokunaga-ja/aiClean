@@ -543,9 +543,14 @@ pub fn find_trash(original_bundle: &Path) -> Result<Option<PathBuf>> {
     }
     #[cfg(target_os = "windows")]
     {
+        let dos = windows_dos_original(
+            original
+                .to_str()
+                .context("Native Trash path encoding unknown")?,
+        )?;
         let output = powershell(
             WINDOWS_FIND_TRASH,
-            &[("AICLEAN_ORIGINAL".into(), original.into_os_string())],
+            &[("AICLEAN_ORIGINAL".into(), dos.into())],
         )?;
         if !output.success {
             bail!("Native Recycle Bin lookup failed");
@@ -631,7 +636,10 @@ pub fn trash(path: &Path) -> Result<PathBuf> {
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         bail!("Only regular bundle directories can enter Trash");
     }
-    if find_trash(&original)?.is_some() {
+    if find_trash(&original)
+        .context("Native Trash pre-move lookup failed")?
+        .is_some()
+    {
         bail!("Original bundle already has a native Trash receipt");
     }
     #[cfg(target_os = "macos")]
@@ -666,14 +674,15 @@ pub fn trash(path: &Path) -> Result<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         windows_recycle(&original)?;
-        find_trash(&original)?.context("Native Recycle Bin receipt unavailable; recover operation")
+        find_trash(&original)
+            .context("Native Recycle Bin post-move receipt lookup failed")?
+            .context("Native Recycle Bin receipt unavailable; recover operation")
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     bail!("Native Trash unsupported on this OS")
 }
 #[cfg(target_os = "windows")]
 fn windows_recycle(path: &Path) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt;
     use windows::{
         Win32::{
             System::Com::{
@@ -688,7 +697,11 @@ fn windows_recycle(path: &Path) -> Result<()> {
         },
         core::PCWSTR,
     };
-    let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let dos = windows_dos_original(
+        path.to_str()
+            .context("Native Trash path encoding unknown")?,
+    )?;
+    let mut wide = dos.encode_utf16().collect::<Vec<_>>();
     if wide.contains(&0) {
         bail!("NUL in native Recycle Bin path");
     }
@@ -730,6 +743,44 @@ fn windows_recycle(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(any(target_os = "windows", test))]
+fn windows_dos_original(path: &str) -> Result<String> {
+    let path = path.strip_prefix(r"\\?\").unwrap_or(path);
+    let bytes = path.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || &bytes[1..3] != b":\\" {
+        bail!("Native Trash original is not an absolute local drive path");
+    }
+    if path.chars().any(|c| c < ' ' || c == '/') || path[2..].contains(':') {
+        bail!("Ambiguous Windows path or alternate data stream refused");
+    }
+    for component in path[3..].split('\\') {
+        if component.is_empty()
+            || component == "."
+            || component == ".."
+            || component.ends_with(['.', ' '])
+        {
+            bail!("Ambiguous Windows path component");
+        }
+        let base = component
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        if matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || ["COM", "LPT"].iter().any(|prefix| {
+                base.strip_prefix(prefix).is_some_and(|number| {
+                    matches!(
+                        number,
+                        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                    )
+                })
+            })
+        {
+            bail!("DOS device name refused in native Trash path");
+        }
+    }
+    Ok(path.to_owned())
+}
 #[cfg(target_os = "windows")]
 const WINDOWS_FIND_TRASH: &str = r#"
 $original=[IO.Path]::GetFullPath($env:AICLEAN_ORIGINAL); $drive=[IO.Path]::GetPathRoot($original); $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $root=Join-Path (Join-Path $drive '$Recycle.Bin') $sid; $matches=@();
@@ -739,6 +790,125 @@ if(Test-Path -LiteralPath $root){ foreach($i in @(Get-ChildItem -LiteralPath $ro
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn windows_fixture_receipt_original(bytes: &[u8]) -> Result<String> {
+        if bytes.len() < 28 || bytes.len() > 65564 {
+            bail!("Unsafe native receipt size");
+        }
+        let version = u64::from_le_bytes(bytes[..8].try_into()?);
+        let (offset, length): (usize, usize) = match version {
+            1 => (24, bytes.len() - 24),
+            2 => {
+                let chars = u32::from_le_bytes(bytes[24..28].try_into()?) as usize;
+                (28, chars.checked_mul(2).context("Receipt length overflow")?)
+            }
+            _ => bail!("Unknown native receipt version"),
+        };
+        let end = offset
+            .checked_add(length)
+            .context("Receipt length overflow")?;
+        if end > bytes.len() || length % 2 != 0 {
+            bail!("Invalid native receipt path length");
+        }
+        let wide = bytes[offset..end]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect::<Vec<_>>();
+        let path = String::from_utf16(&wide).context("Invalid native receipt Unicode")?;
+        let path = path.trim_end_matches('\0');
+        if path.contains('\0') {
+            bail!("Embedded NUL in native receipt");
+        }
+        Ok(path.to_owned())
+    }
+    #[cfg(target_os = "windows")]
+    fn cleanup_owned_recycle_receipt(
+        actual: &Path,
+        original: &Path,
+        fixture_root: &Path,
+    ) -> Result<()> {
+        if original.parent() != Some(fixture_root)
+            || !fixture_root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(".aiClean-native-fixture-"))
+        {
+            bail!("Not this exclusively-created fixture root");
+        }
+        let uuid = original
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("Fixture UUID unavailable")?;
+        if uuid::Uuid::parse_str(uuid)?.to_string() != uuid {
+            bail!("Not an exact fixture UUID basename");
+        }
+        if actual.exists() || fs::read(original.join("fixture.txt"))? != b"recoverable fixture" {
+            bail!("Fixture has not been restored intact");
+        }
+        let name = actual
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("Native recycle basename unavailable")?;
+        let suffix = name
+            .strip_prefix("$R")
+            .context("Not a native recycle data directory")?;
+        if suffix.is_empty() {
+            bail!("Invalid native recycle basename");
+        }
+        let parent = actual
+            .parent()
+            .context("Native recycle parent unavailable")?;
+        if parent.parent().and_then(Path::file_name) != Some(std::ffi::OsStr::new("$Recycle.Bin")) {
+            bail!("Not a native Recycle Bin receipt parent");
+        }
+        let receipt = parent.join(format!("$I{suffix}"));
+        crate::schedule::safe_path(&receipt)?;
+        ensure_single_link(&receipt)?;
+        let size = fs::metadata(&receipt)?.len();
+        if size > 65564 {
+            bail!("Unsafe native receipt size");
+        }
+        let old = windows_fixture_receipt_original(&fs::read(&receipt)?)?;
+        let expected =
+            windows_dos_original(original.to_str().context("Fixture path encoding unknown")?)?;
+        if !windows_dos_original(&old)?.eq_ignore_ascii_case(&expected) {
+            bail!("Native receipt original does not match this fixture UUID path");
+        }
+        fs::remove_file(&receipt)?;
+        Ok(())
+    }
+    #[test]
+    fn fixture_original_normalization_preserves_unicode_and_refuses_ads_or_aliases() {
+        assert_eq!(
+            windows_dos_original(r"\\?\C:\Users\ユーザー\uuid").unwrap(),
+            r"C:\Users\ユーザー\uuid"
+        );
+        for path in [
+            r"C:\root\uuid:stream",
+            r"C:\root:stream\uuid",
+            r"C:relative",
+            r"\\?\C:\root.\uuid",
+            r"\\?\C:\root \uuid",
+            r"C:\root\..\uuid",
+            r"C:\nul.txt\uuid",
+            r"\\.\C:\root\uuid",
+        ] {
+            assert!(windows_dos_original(path).is_err(), "{path}");
+        }
+    }
+    #[test]
+    fn fixture_receipt_requires_valid_version_length_and_utf16() {
+        let old = r"C:\Users\owner\unique-uuid";
+        let wide = old.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        let mut bytes = vec![0u8; 28];
+        bytes[..8].copy_from_slice(&2u64.to_le_bytes());
+        bytes[24..28].copy_from_slice(&(wide.len() as u32).to_le_bytes());
+        for value in wide {
+            bytes.extend(value.to_le_bytes());
+        }
+        assert_eq!(windows_fixture_receipt_original(&bytes).unwrap(), old);
+        bytes[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(windows_fixture_receipt_original(&bytes).is_err());
+    }
     #[test]
     fn windows_inventory_ignores_helper_command_containing_provider_names() {
         let helper=json!({"helper_pid":42,"processes":[{"pid":42,"name":"powershell.exe","command":"-Command script contains claude.exe"},{"pid":43,"name":"explorer.exe","command":null}]}).to_string();
@@ -804,7 +974,7 @@ mod tests {
         assert!(ensure_single_link(&file).is_err());
     }
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[ignore = "Native Trash fixture integration, requires OS Trash permission"]
     fn native_trash_fixture_has_actual_recoverable_path() {
         let home = dirs::home_dir().unwrap();
@@ -816,16 +986,47 @@ mod tests {
         let original = root.join(uuid::Uuid::new_v4().to_string());
         fs::create_dir(&original).unwrap();
         fs::write(original.join("fixture.txt"), b"recoverable fixture").unwrap();
-        let actual = trash(&original).unwrap();
+        let member = original.join("fixture.txt");
+        let original_permissions = fs::metadata(&member).unwrap().permissions();
+        let mut frozen_permissions = original_permissions.clone();
+        frozen_permissions.set_readonly(true);
+        fs::set_permissions(&member, frozen_permissions).unwrap();
+        eprintln!(
+            "aiClean native Trash fixture original: {}",
+            original.display()
+        );
+        let actual = trash(&original).unwrap_or_else(|error| {
+            eprintln!(
+                "aiClean native Trash fixture original_present_after_error: {}",
+                original.exists()
+            );
+            if error.to_string().contains("pre-move") {
+                assert!(
+                    original.exists(),
+                    "Pre-move failure must preserve fixture bundle"
+                );
+            }
+            panic!("{error:#}");
+        });
         assert!(!original.exists());
         assert_eq!(find_trash(&original).unwrap(), Some(actual.clone()));
         assert_eq!(
             fs::read(actual.join("fixture.txt")).unwrap(),
             b"recoverable fixture"
         );
+        assert!(
+            fs::metadata(actual.join("fixture.txt"))
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
         // Restore this exclusively-created fixture before TempDir removes it. Never purge Trash.
         fs::rename(&actual, &original).unwrap();
+        #[cfg(target_os = "windows")]
+        cleanup_owned_recycle_receipt(&actual, &original, &root).unwrap();
         assert_eq!(find_trash(&original).unwrap(), None);
+        // Only this restored fixture member loses its test-only readonly bit for TempDir cleanup.
+        fs::set_permissions(&member, original_permissions).unwrap();
     }
     #[test]
     #[cfg(target_os = "macos")]

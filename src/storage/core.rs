@@ -1079,7 +1079,7 @@ fn restore_file(
                 fs::metadata(&temporary)?.is_file(),
                 "Restore staging path is not a file"
             );
-            fs::remove_file(&temporary)?;
+            discard_restore_stage(&temporary)?;
             sync_dir(parent)?;
         }
         return Ok(());
@@ -1092,7 +1092,7 @@ fn restore_file(
             fs::metadata(&temporary)?.is_file(),
             "Restore staging path is not a file"
         );
-        fs::remove_file(&temporary)?;
+        discard_restore_stage(&temporary)?;
         sync_dir(parent)?;
     }
     let mut output = private_open(&temporary, true)?;
@@ -1108,6 +1108,14 @@ fn restore_file(
     {
         use std::os::unix::fs::PermissionsExt;
         output.set_permissions(fs::Permissions::from_mode(snapshot.mode))?;
+    }
+    #[cfg(windows)]
+    {
+        // Publish content and its readonly attribute together. Retain write
+        // access through the attribute change so FlushFileBuffers can succeed.
+        let mut permissions = output.metadata()?.permissions();
+        permissions.set_readonly(snapshot.readonly);
+        output.set_permissions(permissions)?;
     }
     output.sync_all()?;
     effects.checkpoint(&format!("after-restore-stage-{index}"))?;
@@ -1128,16 +1136,35 @@ fn restore_file(
     sync_dir(parent)?;
     effects.checkpoint(&format!("after-restore-publish-{index}"))?;
     if temporary.exists() {
-        fs::remove_file(temporary)?;
-    }
-    #[cfg(not(unix))]
-    {
-        let mut permissions = fs::metadata(&snapshot.path)?.permissions();
-        permissions.set_readonly(snapshot.readonly);
-        fs::set_permissions(&snapshot.path, permissions)?;
-        File::open(&snapshot.path)?.sync_all()?;
+        discard_restore_stage(&temporary)?;
     }
     sync_dir(parent)?;
+    Ok(())
+}
+fn discard_restore_stage(path: &Path) -> Result<()> {
+    no_links(path, false)?;
+    platform::ensure_single_link(path)?;
+    ensure!(
+        fs::metadata(path)?.is_file(),
+        "Restore staging path is not a file"
+    );
+    #[cfg(windows)]
+    {
+        let mut permissions = fs::metadata(path)?.permissions();
+        if permissions.readonly() {
+            // Windows-only: permit removal of this receipt's uniquely owned
+            // disposable stage, never change the destination file's attributes.
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            fs::set_permissions(path, permissions)?;
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)?
+                .sync_all()?;
+        }
+    }
+    fs::remove_file(path)?;
     Ok(())
 }
 fn verify_file(snapshot: &FileSnapshot) -> Result<()> {
@@ -1395,6 +1422,12 @@ fn no_links(path: &Path, allow_missing: bool) -> Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component);
+        // A Windows drive prefix such as \\?\C: is not an absolute filesystem
+        // root until its following RootDir is pushed. Query every real root
+        // and descendant as before, without probing that incomplete prefix.
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
         match fs::symlink_metadata(&current) {
             Ok(metadata) => {
                 // macOS's fixed system aliases are above user data roots.
@@ -1576,10 +1609,15 @@ fn freeze_bundle(bundle: &Path) -> Result<()> {
     for entry in fs::read_dir(bundle)? {
         let path = entry?.path();
         no_links(&path, false)?;
-        let mut permissions = fs::metadata(&path)?.permissions();
+        platform::ensure_single_link(&path)?;
+        // Windows flush requires write access. Acquire it while the captured
+        // private copy is writable, then retain it through the readonly change.
+        let captured = OpenOptions::new().read(true).write(true).open(&path)?;
+        ensure!(captured.metadata()?.is_file(), "Unexpected bundle member");
+        let mut permissions = captured.metadata()?.permissions();
         permissions.set_readonly(true);
-        fs::set_permissions(&path, permissions)?;
-        File::open(path)?.sync_all()?;
+        captured.set_permissions(permissions)?;
+        captured.sync_all()?;
     }
     sync_dir(bundle)
 }
@@ -2725,6 +2763,116 @@ mod tests {
         }
         fixture.undo(None).unwrap();
         fixture.assert_original();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_canonical_verbatim_paths_validate_without_querying_drive_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        assert!(
+            matches!(root.components().next(),Some(Component::Prefix(prefix)) if matches!(prefix.kind(),std::path::Prefix::VerbatimDisk(_)))
+        );
+        let file = root.join("fixture.jsonl");
+        fs::write(&file, b"disposable fixture").unwrap();
+        no_links(&root, false).unwrap();
+        no_links(&file, false).unwrap();
+        validate_source(&root, &file, false).unwrap();
+        let missing = root.join("not-created").join("missing.jsonl");
+        no_links(&missing, true).unwrap();
+        assert!(no_links(&missing, false).is_err());
+        assert!(!missing.exists());
+        let traversal = PathBuf::from(format!("{}\\child\\..\\fixture.jsonl", root.display()));
+        assert!(no_links(&traversal, true).is_err());
+        assert!(no_links(&root.join("fixture.jsonl:alternate-stream"), true).is_err());
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_readonly_snapshot_is_flushed_before_durable_cleanup_ack() {
+        let fixture = Fixture::new();
+        fixture.run(None).unwrap();
+        let receipt = load_receipts(&fixture.state, Provider::Codex)
+            .unwrap()
+            .remove(0)
+            .1;
+        assert_eq!(receipt.phase, "complete");
+        assert!(receipt.manifest_sha256.is_some());
+        let bundle = receipt.trash.clone().unwrap();
+        verify_bundle(&receipt, &bundle).unwrap();
+        for entry in fs::read_dir(&bundle).unwrap() {
+            let entry = entry.unwrap();
+            assert!(entry.metadata().unwrap().permissions().readonly());
+            assert!(!fs::read(entry.path()).unwrap().is_empty());
+        }
+        fixture.undo(None).unwrap();
+        fixture.assert_original();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_restored_readonly_attribute_is_flushed_with_retained_write_handle() {
+        for interruption in [
+            None,
+            Some("after-restore-stage-0"),
+            Some("after-restore-publish-0"),
+        ] {
+            let fixture = Fixture::new();
+            private_dir(&fixture.state).unwrap();
+            let bundle = fixture.state.join("readonly-restore-fixture");
+            private_dir(&bundle).unwrap();
+            let copy = bundle.join("file-0");
+            fs::write(&copy, b"readonly restored fixture").unwrap();
+            let (sha256, bytes) = hash_file(&copy).unwrap();
+            let path = fixture.session.files[0].clone();
+            fs::remove_file(&path).unwrap();
+            let snapshot = FileSnapshot {
+                path: path.clone(),
+                copy: "file-0".into(),
+                sha256,
+                bytes,
+                mode: 0,
+                readonly: true,
+            };
+            let unit = Uuid::new_v4().to_string();
+            let first = restore_file(
+                &fixture.session.root,
+                &snapshot,
+                &bundle,
+                &unit,
+                0,
+                &Fake::new(&fixture.state, interruption),
+            );
+            if interruption.is_some() {
+                assert!(first.is_err());
+                restore_file(
+                    &fixture.session.root,
+                    &snapshot,
+                    &bundle,
+                    &unit,
+                    0,
+                    &Fake::new(&fixture.state, None),
+                )
+                .unwrap();
+            } else {
+                first.unwrap();
+            }
+            assert!(
+                fs::metadata(&path).unwrap().permissions().readonly(),
+                "{interruption:?}"
+            );
+            verify_file(&snapshot).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), b"readonly restored fixture");
+            assert!(
+                !fixture
+                    .session
+                    .root
+                    .join(format!(".aiClean-restore-{unit}-0"))
+                    .exists()
+            );
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            // Windows-only cleanup of this test's disposable readonly restored file.
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            fs::set_permissions(&path, permissions).unwrap();
+        }
     }
     #[cfg(target_os = "macos")]
     #[test]
