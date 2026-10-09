@@ -810,7 +810,9 @@ mod tests {
             bail!("Invalid native receipt path length");
         }
         let wide = bytes[offset..end]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect::<Vec<_>>();
         let path = String::from_utf16(&wide).context("Invalid native receipt Unicode")?;
