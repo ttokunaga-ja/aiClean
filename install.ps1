@@ -1,4 +1,4 @@
-﻿# irm https://raw.githubusercontent.com/ttokunaga-ja/aiClean/main/install.ps1 | iex
+# irm https://raw.githubusercontent.com/ttokunaga-ja/aiClean/main/install.ps1 | iex
 # BIN_DIR overrides the destination. AICLEAN_INSTALL_NO_PATH=1 is for isolated tests.
 # Keep this scoped and never call exit: iex runs inside the user's PowerShell.
 & {
@@ -6,11 +6,11 @@
     if ($env:OS -ne 'Windows_NT' -or -not [Environment]::Is64BitOperatingSystem) { throw 'This installer requires Windows x64' }
     # Intended entry point; repository and release must be published first.
     $bin = if ($env:BIN_DIR) { $env:BIN_DIR } else { Join-Path $env:USERPROFILE '.local\bin' }
-    if (-not [IO.Path]::IsPathRooted($bin)) { throw 'BIN_DIR は絶対パスにしてください' }
+    if (-not [IO.Path]::IsPathRooted($bin)) { throw 'BIN_DIR must be an absolute path' }
     $bin = [IO.Path]::GetFullPath($bin)
     if ($bin -ne [IO.Path]::GetPathRoot($bin)) { $bin = $bin.TrimEnd('\') }
-    if ($bin.Contains(';') -or $bin.Contains("`r") -or $bin.Contains("`n")) { throw 'BIN_DIR に PATH の区切り文字や改行は使えません' }
-    if ($env:AICLEAN_INSTALL_NO_PATH -ne '1' -and $bin.Contains('%')) { throw 'PATH を自動設定する場合、BIN_DIR に % は使えません' }
+    if ($bin.Contains(';') -or $bin.Contains("`r") -or $bin.Contains("`n")) { throw 'BIN_DIR cannot contain PATH delimiters or newlines' }
+    if ($env:AICLEAN_INSTALL_NO_PATH -ne '1' -and $bin.Contains('%')) { throw 'BIN_DIR cannot contain % when configuring PATH' }
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     $temp = Join-Path ([IO.Path]::GetTempPath()) ('aiClean-install-' + [Guid]::NewGuid().ToString('N'))
     $stage = $null
@@ -82,13 +82,13 @@
             return $expected
         }
         $expected = Get-ExpectedHash $manifest $asset
-        if ((Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash -ine $expected) { throw 'SHA-256 が一致しません' }
+        if ((Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash -ine $expected) { throw 'SHA-256 mismatch' }
         New-Item -ItemType Directory -Path $bin -Force | Out-Null
         $exe = Join-Path $bin 'aiClean.exe'
         if (Test-Path -LiteralPath $exe) {
             $existing = Get-Item -LiteralPath $exe -Force
             if ($existing.PSIsContainer -or ($existing.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-                throw 'インストール先が通常ファイルではないため変更しません'
+                throw 'Installation destination is not a regular file; refusing to modify it'
             }
         }
         $stage = Join-Path $bin ('.aiClean-install-' + [Guid]::NewGuid().ToString('N') + '.exe')
@@ -121,18 +121,18 @@
                 $backup = Join-Path $bin ('.aiClean-backup-' + [Guid]::NewGuid().ToString('N') + '.exe')
                 try { [IO.File]::Replace($stage, $exe, $backup) }
                 catch {
-                    if (Test-Path -LiteralPath $backup) { Write-Warning "既存の実行ファイルの退避先を保持しました: $backup" }
+                    if (Test-Path -LiteralPath $backup) { Write-Warning "Preserved backup of the existing executable: $backup" }
                     throw
                 }
             } else { [IO.File]::Move($stage, $exe) }
             if ($backup -and (Test-Path -LiteralPath $backup)) {
                 try { Remove-Item -LiteralPath $backup -Force }
-                catch { Write-Warning "インストール済みですが、旧版の退避先を削除できませんでした: $backup" }
+                catch { Write-Warning "Installed, but could not remove the previous executable backup: $backup" }
             }
         }
         Install-Staged $stage $exe $bin
         $stage = $null
-        Write-Host "インストールしました: $exe ($version)"
+        Write-Host "Installed: $exe ($version)"
 
         if ($env:AICLEAN_INSTALL_NO_PATH -ne '1') {
             $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
@@ -158,12 +158,12 @@ namespace AiCleanInstaller {
                     }
                     $result = [UIntPtr]::Zero
                     [void][AiCleanInstaller.EnvironmentNotification]::SendMessageTimeout([IntPtr]0xffff, 0x1a, [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$result)
-                    Write-Host "ユーザー PATH に $bin を追加しました"
+                    Write-Host "Added $bin to user PATH"
                 }
             } finally { $key.Close() }
             $current = @($env:Path -split ';' | Where-Object { [Environment]::ExpandEnvironmentVariables($_).Trim().Trim('"').TrimEnd('\') -ieq $bin })
             if ($current.Count -eq 0) { $env:Path = $bin + ';' + $env:Path }
-            Write-Host 'この PowerShell で aiClean を使えます。'
+            Write-Host 'aiClean is available in this PowerShell session.'
         }
     } finally {
         if ($client) { $client.Dispose() }

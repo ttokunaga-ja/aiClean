@@ -1,6 +1,9 @@
 # Isolated native Windows fixtures: load only helper ASTs, never installer entry point.
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
+# irm returns decoded text; a UTF-8 BOM becomes a command token under iex.
+$installerBytes = [IO.File]::ReadAllBytes((Join-Path $root 'install.ps1'))
+if ($installerBytes | Where-Object { $_ -gt 127 }) { throw 'Installer must be BOM-free ASCII for both iex and Windows PowerShell 5.1 file loading' }
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'install.ps1'), [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw (($errors | ForEach-Object { 'Line ' + $_.Extent.StartLineNumber + ': ' + $_.Message }) -join "`n") }
