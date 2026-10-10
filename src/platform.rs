@@ -370,7 +370,7 @@ pub fn ensure_single_link(path: &Path) -> Result<()> {
     Ok(())
 }
 #[cfg(target_os = "windows")]
-const WINDOWS_PRIVATE_DIRECTORY_ACL: &str = r#"$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User; $acl=New-Object Security.AccessControl.DirectorySecurity; $acl.SetOwner($sid); $acl.SetAccessRuleProtection($true,$false); foreach($principal in @($sid,(New-Object Security.Principal.SecurityIdentifier('S-1-5-18')))){$rule=New-Object Security.AccessControl.FileSystemAccessRule($principal,'FullControl','ContainerInherit,ObjectInherit','None','Allow');$acl.AddAccessRule($rule)}; Set-Acl -LiteralPath $env:AICLEAN_PRIVATE_DIR -AclObject $acl"#;
+const WINDOWS_PRIVATE_DIRECTORY_ACL: &str = r#"$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User; $acl=New-Object Security.AccessControl.DirectorySecurity; $acl.SetOwner($sid); $acl.SetAccessRuleProtection($true,$false); foreach($principal in @($sid,(New-Object Security.Principal.SecurityIdentifier('S-1-5-18')))){$rule=New-Object Security.AccessControl.FileSystemAccessRule($principal,'FullControl','ContainerInherit,ObjectInherit','None','Allow');$acl.AddAccessRule($rule)}; [IO.Directory]::SetAccessControl($env:AICLEAN_PRIVATE_DIR,$acl)"#;
 /// Establish privacy for an aiClean-owned directory before writing raw conversation data.
 pub fn ensure_private_directory(path: &Path) -> Result<()> {
     crate::schedule::safe_path(path)?;
@@ -804,7 +804,7 @@ mod tests {
         // CI runs Cargo from PowerShell 7: the intermediate Rust process inherits its
         // module path unchanged. Run this same native boundary under either shell.
         let output = powershell(
-            "$command=Get-Command Set-Acl -ErrorAction Stop; if($command.CommandType -ne 'Cmdlet'){throw 'Native Security cmdlet missing'}; 'native-security-cmdlet'",
+            "$command=Get-Command Get-Acl -ErrorAction Stop; if($command.CommandType -ne 'Cmdlet'){throw 'Native Security cmdlet missing'}; 'native-security-cmdlet'",
             &[],
         ).unwrap();
         assert!(
@@ -816,6 +816,22 @@ mod tests {
         let private = root.join("owned-private-fixture");
         fs::create_dir(&private).unwrap();
         ensure_private_directory(&private).unwrap();
+        // Re-establish privacy on an existing protected state directory, as every
+        // durable attempt write does. This must also work with a limited user token.
+        ensure_private_directory(&private).unwrap();
+        let roots = crate::model::Roots {
+            claude: root.join("claude"),
+            codex: root.join("codex"),
+        };
+        let attempt = serde_json::json!({"success": false, "diagnostic": "fixture"});
+        crate::storage::record_attempt(&roots, &private, crate::model::Provider::Claude, &attempt)
+            .unwrap();
+        crate::storage::record_attempt(&roots, &private, crate::model::Provider::Claude, &attempt)
+            .unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(private.join("attempt-claude.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved, attempt);
         let script = r#"$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User;
 $stored=Get-Acl -LiteralPath $env:AICLEAN_PRIVATE_DIR;
 if(-not $stored.AreAccessRulesProtected -or $stored.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value){throw 'Protected fixture ownership missing'}
