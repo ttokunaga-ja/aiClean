@@ -6,8 +6,8 @@ pub fn safe(s: &str, limit: usize) -> String {
     ai_clean::providers::terminal_safe(s, limit)
 }
 fn diagnostic(s: &str) -> String {
-    if s.contains("Conversation application, CLI, or code host is running") {
-        "会話アプリ・CLI・エディタが起動中です。終了してから整理・復元を再実行してください。".into()
+    if s.contains("Selected provider application or CLI is running") {
+        "選択したプロバイダーの会話アプリ・CLIが起動中です。終了してから整理・復元を再実行してください。".into()
     } else {
         safe(s, 4000)
     }
@@ -172,18 +172,6 @@ fn recovery(out: &mut String, v: &Value, history: bool) {
             }
         );
     }
-}
-fn purge(out: &mut String, v: &Value) {
-    let configured = v["configured"] == true && v["verified"] == true;
-    let _ = writeln!(
-        out,
-        "  OSゴミ箱の30日自動削除: {}",
-        if configured {
-            "確認済み"
-        } else {
-            "未確認または無効 — 整理は実行できません。OSの30日自動削除設定を確認してください。"
-        }
-    );
 }
 fn skips(out: &mut String, r: &Value) {
     if let Some(map) = r["skipped_by_reason"].as_object() {
@@ -409,7 +397,6 @@ pub fn render(result: &Value) -> String {
                     "  アプリ稼働チェック: 実行を妨げるプロセスは検出されませんでした（整理可能の保証ではありません）。"
                 );
             }
-            purge(&mut out, &r["trash_purge"]);
             let _ = writeln!(
                 out,
                 "  整理は毎月10日以降に月1回。今月初日00:00より前の実際の会話のみが対象です。タイトル・作成日時・更新日時は判定に使いません。"
@@ -435,6 +422,13 @@ mod tests {
         assert_eq!(safe("あいうえ", 2), "あい…");
     }
     #[test]
+    fn process_refusal_names_only_selected_provider_applications() {
+        let text =
+            diagnostic("Selected provider application or CLI is running; close it before mutation");
+        assert!(text.contains("選択したプロバイダーの会話アプリ・CLI"));
+        assert!(!text.contains("エディタ"));
+    }
+    #[test]
     fn important_outcomes() {
         for (fields, wanted) in [
             (json!({"already_completed":true}), "すでに整理済み"),
@@ -450,13 +444,10 @@ mod tests {
             assert!(render(&json!({"results":[r]})).contains(wanted));
         }
         let s = render(
-            &json!({"results":[{"command":"status","provider":"codex","schedule":{"desired_enabled":true,"actual":{"enabled":null}},"storage":{"pending_operations":[{"batch":"abc","phase":"captured"}],"last_attempt":{"error":"process open"}},"trash_purge":{"verified":false}}]}),
+            &json!({"results":[{"command":"status","provider":"codex","schedule":{"desired_enabled":true,"actual":{"enabled":null}},"storage":{"pending_operations":[{"batch":"abc","phase":"captured"}],"last_attempt":{"error":"process open"}}}]}),
         );
         assert!(
-            s.contains("不明 / 設定上: 有効")
-                && s.contains("abc")
-                && s.contains("process open")
-                && s.contains("整理は実行できません")
+            s.contains("不明 / 設定上: 有効") && s.contains("abc") && s.contains("process open")
         );
     }
 }

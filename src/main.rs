@@ -186,7 +186,7 @@ fn execute(cli: &Cli) -> Result<(Value, bool)> {
                     let (sessions, skipped) = select(&inventory, boundary);
                     let candidates = sessions.iter().map(|s| { let (title, diagnostics) = providers::display_title(s); Ok(json!({"id":s.id,"title":title,"title_diagnostic":if diagnostics.is_empty(){None}else{Some(diagnostics.join("; "))},"last_message_ms":s.last_message_ms,"bytes":log_bytes(std::slice::from_ref(s))?})) }).collect::<Result<Vec<Value>>>()?;
                     Ok(
-                        json!({"provider":p,"command":"check","read_only":true,"candidates":candidates,"candidate_count":sessions.len(),"candidate_log_bytes":log_bytes(&sessions)?,"skipped_by_reason":skipped,"warnings":inventory.warnings,"database":database_capacity(roots.get(p))?,"recovery":storage::status(&roots,&state,p)?,"mutation_block_reason":platform::ensure_quiet(p).err().map(|e|format!("{e:#}")),"trash_purge":platform::purge_status()?}),
+                        json!({"provider":p,"command":"check","read_only":true,"candidates":candidates,"candidate_count":sessions.len(),"candidate_log_bytes":log_bytes(&sessions)?,"skipped_by_reason":skipped,"warnings":inventory.warnings,"database":database_capacity(roots.get(p))?,"recovery":storage::status(&roots,&state,p)?,"mutation_block_reason":platform::ensure_quiet(p).err().map(|e|format!("{e:#}"))}),
                     )
                 }
                 Commands::Run { scheduled, .. } => {
@@ -213,7 +213,7 @@ fn execute(cli: &Cli) -> Result<(Value, bool)> {
                 Commands::Enable(_) => schedule::enable(&state, p),
                 Commands::Stop(_) => schedule::stop(&state, p),
                 Commands::Status(_) => Ok(
-                    json!({"provider":p,"command":"status","schedule":schedule::status(&state,p)?,"storage":storage::status(&roots,&state,p)?,"trash_purge":platform::purge_status()?,"mutation_block_reason":platform::ensure_quiet(p).err().map(|e|format!("{e:#}")),"state_dir":state}),
+                    json!({"provider":p,"command":"status","schedule":schedule::status(&state,p)?,"storage":storage::status(&roots,&state,p)?,"mutation_block_reason":platform::ensure_quiet(p).err().map(|e|format!("{e:#}")),"state_dir":state}),
                 ),
                 Commands::Undo { .. } => storage::undo(&roots, &state, p, batch),
                 _ => unreachable!(),

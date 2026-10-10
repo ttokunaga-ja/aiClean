@@ -304,7 +304,6 @@ fn request_stop_and_lock(state: &Path, p: Provider) -> Result<std::fs::File> {
 pub fn enable(state: &Path, p: Provider) -> Result<Value> {
     require_supported()?;
     safe_path(state)?;
-    crate::platform::ensure_trash_purge_supported(state)?;
     let _lock = crate::storage::maintenance_lock(state)?;
     let _scheduler_lock = scheduler_lock(state)?;
     let previous = read_config(state, p)?;

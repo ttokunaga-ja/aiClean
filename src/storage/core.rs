@@ -144,10 +144,6 @@ impl Receipt {
 trait Effects {
     fn quiet(&self, provider: Provider) -> Result<()>;
     fn verify_candidate(&self, session: &Session, cutoff: i64) -> Result<()>;
-    fn purge(&self) -> Result<()>;
-    fn purge_for_state(&self, _state: &Path) -> Result<()> {
-        self.purge()
-    }
     fn trash(&self, path: &Path) -> Result<PathBuf>;
     fn find_trash(&self, path: &Path) -> Result<Option<PathBuf>>;
     fn headroom(&self, path: &Path, bytes: u64) -> Result<()> {
@@ -168,13 +164,6 @@ impl Effects for Native {
     }
     fn verify_candidate(&self, session: &Session, cutoff: i64) -> Result<()> {
         crate::providers::verify_candidate(session, cutoff)
-    }
-    fn purge(&self) -> Result<()> {
-        platform::ensure_purge_enabled()
-    }
-    fn purge_for_state(&self, state: &Path) -> Result<()> {
-        platform::ensure_trash_purge_supported(state)?;
-        self.purge()
     }
     fn trash(&self, path: &Path) -> Result<PathBuf> {
         platform::trash(path)
@@ -246,7 +235,6 @@ fn run_with(
         return Ok(result);
     }
     effects.quiet(provider)?;
-    effects.purge_for_state(state)?;
     let mut owned_files = BTreeSet::new();
     for session in sessions
         .iter()
@@ -1750,9 +1738,6 @@ mod tests {
         fn verify_candidate(&self, _: &Session, _: i64) -> Result<()> {
             Ok(())
         }
-        fn purge(&self) -> Result<()> {
-            Ok(())
-        }
         fn headroom(&self, _: &Path, _: u64) -> Result<()> {
             Ok(())
         }
@@ -2106,9 +2091,6 @@ mod tests {
             fn verify_candidate(&self, s: &Session, c: i64) -> Result<()> {
                 self.fake.verify_candidate(s, c)
             }
-            fn purge(&self) -> Result<()> {
-                self.fake.purge()
-            }
             fn trash(&self, p: &Path) -> Result<PathBuf> {
                 self.fake.trash(p)
             }
@@ -2340,9 +2322,6 @@ mod tests {
                 }
                 Ok(())
             }
-            fn purge(&self) -> Result<()> {
-                self.fake.purge()
-            }
             fn trash(&self, p: &Path) -> Result<PathBuf> {
                 self.fake.trash(p)
             }
@@ -2381,9 +2360,6 @@ mod tests {
             }
             fn verify_candidate(&self, s: &Session, c: i64) -> Result<()> {
                 self.0.verify_candidate(s, c)
-            }
-            fn purge(&self) -> Result<()> {
-                self.0.purge()
             }
             fn trash(&self, p: &Path) -> Result<PathBuf> {
                 self.0.trash(p)
@@ -2533,9 +2509,6 @@ mod tests {
             }
             fn verify_candidate(&self, s: &Session, c: i64) -> Result<()> {
                 self.0.verify_candidate(s, c)
-            }
-            fn purge(&self) -> Result<()> {
-                self.0.purge()
             }
             fn trash(&self, p: &Path) -> Result<PathBuf> {
                 self.0.trash(p)
@@ -2896,9 +2869,6 @@ mod tests {
                             .all(|d| d.path.starts_with(&self.root)),
                     "Native test only permits its disposable fixture"
                 );
-                Ok(())
-            }
-            fn purge(&self) -> Result<()> {
                 Ok(())
             }
             fn headroom(&self, _: &Path, _: u64) -> Result<()> {

@@ -1,7 +1,8 @@
 //! Native OS boundaries. Child output is captured and never echoed (process arguments can contain secrets).
 use crate::model::Provider;
 use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
+#[cfg(test)]
+use serde_json::json;
 use std::{
     ffi::OsString,
     fs,
@@ -76,7 +77,7 @@ pub(crate) fn powershell(script: &str, env: &[(OsString, OsString)]) -> Result<C
     let exe = PathBuf::from(root).join("System32/WindowsPowerShell/v1.0/powershell.exe");
     run_command(exe.to_str().context("Unsupported helper path")?,&["-NoLogo".into(),"-NoProfile".into(),"-NonInteractive".into(),"-Command".into(),format!("$ErrorActionPreference='Stop'; [Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false); {script}").into()],env)
 }
-fn process_is_busy(command: &str, _provider: Provider) -> bool {
+fn process_is_busy(command: &str, provider: Provider) -> bool {
     let s = command.to_ascii_lowercase();
     let first = s.split_whitespace().next().unwrap_or("");
     let name = first
@@ -84,46 +85,42 @@ fn process_is_busy(command: &str, _provider: Provider) -> bool {
         .next()
         .unwrap_or(first)
         .trim_matches('"');
-    if name == "aiclean" || name == "aiclean.exe" || name == "ps" {
+    if matches!(name, "aiclean" | "aiclean.exe" | "ps") {
         return false;
     }
-    [
-        "claude.app/",
-        "codex.app/",
-        "claude.exe",
-        "codex.exe",
-        "@anthropic-ai/claude-code",
-        "@openai/codex",
-        "visual studio code",
-        "code helper",
-        "cursor.app/",
-        "cursor.exe",
-        "windsurf.app/",
-        "windsurf.exe",
-        "zed.app/",
-        "zed.exe",
-        "vscodium",
-        "antigravity",
-        "intellij idea",
-        "pycharm",
-        "webstorm",
-        "idea64.exe",
-        "code -",
-        "code.exe",
-    ]
-    .iter()
-    .any(|needle| s.contains(needle))
-        || matches!(
-            name,
-            "claude" | "codex" | "code" | "cursor" | "windsurf" | "zed"
-        )
+    if matches!(
+        (provider, name),
+        (Provider::Claude, "codex" | "codex.exe") | (Provider::Codex, "claude" | "claude.exe")
+    ) {
+        return false;
+    }
+    let (application, executable, package, cli, script) = match provider {
+        Provider::Claude => (
+            "claude.app/",
+            "claude.exe",
+            "@anthropic-ai/claude-code",
+            "claude",
+            "claude.js",
+        ),
+        Provider::Codex => (
+            "codex.app/",
+            "codex.exe",
+            "@openai/codex",
+            "codex",
+            "codex.js",
+        ),
+    };
+    [application, executable, package]
+        .iter()
+        .any(|needle| s.contains(needle))
+        || name == cli
         || s.split_whitespace().any(|part| {
             let name = part
                 .trim_matches(['"', '\''])
                 .rsplit(['/', '\\'])
                 .next()
                 .unwrap_or(part);
-            matches!(name, "claude" | "claude.js" | "codex" | "codex.js")
+            name == cli || name == script
         })
 }
 #[cfg(any(target_os = "macos", test))]
@@ -167,12 +164,7 @@ fn windows_inventory_busy(text: &str, provider: Provider) -> Result<bool> {
             continue;
         }
         let name = process.name.to_ascii_lowercase();
-        if process.command.is_none()
-            && matches!(
-                name.as_str(),
-                "node.exe" | "electron.exe" | "claude.exe" | "codex.exe"
-            )
-        {
+        if process.command.is_none() && matches!(name.as_str(), "node.exe" | "electron.exe") {
             return Ok(true);
         }
         if process_is_busy(
@@ -208,9 +200,7 @@ pub fn ensure_quiet(provider: Provider) -> Result<()> {
         }
         #[cfg(target_os = "windows")]
         if windows_inventory_busy(&output.stdout, provider)? {
-            bail!(
-                "Conversation application, CLI, or code host is running; close it before mutation"
-            );
+            bail!("Selected provider application or CLI is running; close it before mutation");
         }
         #[cfg(target_os = "macos")]
         for line in output.stdout.lines().filter(|line| !line.trim().is_empty()) {
@@ -220,65 +210,11 @@ pub fn ensure_quiet(provider: Provider) -> Result<()> {
                 None => continue,
             };
             if process_is_busy(command, provider) {
-                bail!(
-                    "Conversation application, CLI, or code host is running; close it before mutation"
-                );
+                bail!("Selected provider application or CLI is running; close it before mutation");
             }
         }
         Ok(())
     }
-}
-pub fn purge_status() -> Result<Value> {
-    #[cfg(target_os = "macos")]
-    {
-        let output = run_command(
-            "/usr/bin/defaults",
-            &[
-                "read".into(),
-                "com.apple.finder".into(),
-                "FXRemoveOldTrashItems".into(),
-            ],
-            &[],
-        )?;
-        let configured = if output.success {
-            match output.stdout.trim() {
-                "1" | "true" => Some(true),
-                "0" | "false" => Some(false),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        Ok(
-            json!({"os":"macos","mechanism":"Finder","configured":configured,"enabled":configured,"days":if configured==Some(true){Some(30)}else{None},"verified":configured.is_some(),"setting":"FXRemoveOldTrashItems","note":"OS performs purge; aiClean never purges Trash"}),
-        )
-    }
-    #[cfg(target_os = "windows")]
-    {
-        // Only the documented policy is accepted. Unspecified or unverified user settings fail closed.
-        let output = powershell(
-            r#"$p=Get-ItemProperty -LiteralPath 'HKLM:\Software\Policies\Microsoft\Windows\StorageSense' -ErrorAction SilentlyContinue; if ($null -eq $p) { @{configured=$null;enabled=$null;days=$null;verified=$false} | ConvertTo-Json -Compress } else { $enabled=$p.AllowStorageSenseGlobal; $days=$p.ConfigStorageSenseRecycleBinCleanupThreshold; $cadence=$p.ConfigStorageSenseGlobalCadence; @{configured=($enabled -eq 1 -and $days -eq 30 -and $cadence -in @(1,7,30));enabled=$enabled;days=$days;cadence=$cadence;verified=($null -ne $enabled -and $null -ne $days -and $null -ne $cadence);source='documented StorageSense policy'} | ConvertTo-Json -Compress }"#,
-            &[],
-        )?;
-        if !output.success {
-            return Ok(json!({"os":"windows","configured":null,"verified":false}));
-        }
-        let mut value: Value = serde_json::from_str(output.stdout.trim())
-            .context("Cannot verify Storage Sense policy")?;
-        value["os"] = json!("windows");
-        Ok(value)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    Ok(json!({"os":std::env::consts::OS,"configured":null,"verified":false,"supported":false}))
-}
-pub fn ensure_purge_enabled() -> Result<()> {
-    let s = purge_status()?;
-    if s["configured"] != true {
-        bail!(
-            "OS 30-day automatic Trash purge is not verifiably enabled; configure it in OS settings first"
-        );
-    }
-    Ok(())
 }
 pub fn ensure_headroom(path: &Path, additional_bytes: u64) -> Result<()> {
     let required = additional_bytes
@@ -287,51 +223,6 @@ pub fn ensure_headroom(path: &Path, additional_bytes: u64) -> Result<()> {
     if fs2::available_space(path)? < required {
         bail!("Cleanup requires 8 GiB free space after the estimated recoverable copy");
     }
-    Ok(())
-}
-#[cfg(any(target_os = "windows", test))]
-fn system_drive_matches(path: &str, windows_directory: &str) -> bool {
-    fn drive(path: &str) -> Option<u8> {
-        let path = path.strip_prefix("\\\\?\\").unwrap_or(path);
-        let bytes = path.as_bytes();
-        if bytes.len() < 3
-            || !bytes[0].is_ascii_alphabetic()
-            || bytes[1] != b':'
-            || !matches!(bytes[2], b'\\' | b'/')
-        {
-            return None;
-        }
-        Some(bytes[0].to_ascii_uppercase())
-    }
-    let expected = drive(windows_directory);
-    expected.is_some() && drive(path) == expected
-}
-/// Windows Storage Sense is only documented to purge the Windows system drive.
-pub fn ensure_trash_purge_supported(path: &Path) -> Result<()> {
-    #[cfg(target_os = "windows")]
-    {
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn GetWindowsDirectoryW(buffer: *mut u16, size: u32) -> u32;
-        }
-        let mut buffer = vec![0u16; 32768];
-        let length = unsafe { GetWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
-        if length == 0 || length as usize >= buffer.len() {
-            bail!("Windows system drive cannot be verified");
-        }
-        let directory = String::from_utf16(&buffer[..length as usize])
-            .context("Unknown Windows system directory encoding")?;
-        if !system_drive_matches(
-            path.to_str().context("Unknown Trash path encoding")?,
-            &directory,
-        ) {
-            bail!(
-                "Storage Sense only verifies automatic Trash purge on the Windows system drive; other drives refused"
-            );
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    let _ = path;
     Ok(())
 }
 /// Refuse shared inode/file records before editing a provider's regular source file.
@@ -636,7 +527,6 @@ fn mac_metadata_matches(path: &Path, original: &Path) -> Result<bool> {
 }
 pub fn trash(path: &Path) -> Result<PathBuf> {
     let original = absolute_original(path)?;
-    ensure_trash_purge_supported(&original)?;
     crate::schedule::safe_path(&original)?;
     let metadata = fs::symlink_metadata(&original)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -994,23 +884,6 @@ foreach($rule in $rules){if($rule.IsInherited -or $rule.IdentityReference.Value 
         ));
     }
     #[test]
-    fn storage_sense_scope_refuses_other_drives_and_unc_paths() {
-        assert!(system_drive_matches(
-            "C:\\Users\\ユーザー\\.aiClean",
-            "C:\\Windows"
-        ));
-        assert!(system_drive_matches(
-            "\\\\?\\c:\\Users\\owner",
-            "C:\\Windows"
-        ));
-        assert!(!system_drive_matches("D:\\state", "C:\\Windows"));
-        assert!(!system_drive_matches(
-            "\\\\server\\share\\state",
-            "C:\\Windows"
-        ));
-        assert!(!system_drive_matches("C:relative", "C:\\Windows"));
-    }
-    #[test]
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn exclusive_restore_refuses_existing_destination_and_leaves_one_link() {
         let temp = tempfile::tempdir().unwrap();
@@ -1118,23 +991,89 @@ foreach($rule in $rules){if($rule.IsInherited -or $rule.IdentityReference.Value 
         assert!(mac_find_metadata(&root, &original).is_err());
     }
     #[test]
-    fn process_detection_includes_apps_node_cli_and_code_hosts() {
-        for command in [
-            "/Applications/Codex.app/Contents/MacOS/Codex",
-            "node /usr/lib/node_modules/@openai/codex/bin/codex.js",
-            "/Applications/Visual Studio Code.app/Contents/MacOS/Electron",
-            "node /tmp/node_modules/@anthropic-ai/claude-code/cli.js",
+    fn process_detection_checks_only_selected_provider() {
+        for (command, owner) in [
+            (
+                "/Applications/Codex.app/Contents/MacOS/Codex",
+                Provider::Codex,
+            ),
+            (
+                "node /usr/lib/node_modules/@openai/codex/bin/codex.js",
+                Provider::Codex,
+            ),
+            (r"C:\Users\owner\codex.exe", Provider::Codex),
+            (
+                "/Applications/Claude.app/Contents/MacOS/Claude",
+                Provider::Claude,
+            ),
+            (
+                "node /tmp/node_modules/@anthropic-ai/claude-code/cli.js",
+                Provider::Claude,
+            ),
+            (r"C:\Users\owner\claude.exe", Provider::Claude),
+            ("claude", Provider::Claude),
+            ("codex", Provider::Codex),
+            ("codex.exe --prompt claude", Provider::Codex),
+            ("claude.exe --prompt codex", Provider::Claude),
         ] {
-            assert!(process_is_busy(command, Provider::Codex), "{command}");
+            for selected in [Provider::Claude, Provider::Codex] {
+                assert_eq!(
+                    process_is_busy(command, selected),
+                    owner == selected,
+                    "{command}: {selected:?}"
+                );
+            }
         }
-        assert!(!process_is_busy(
+        for command in [
+            "/Applications/Visual Studio Code.app/Contents/MacOS/Electron",
+            "Code.exe --type=renderer",
+            "cursor.exe",
             "/usr/bin/ps -axo comm=,args=",
-            Provider::Codex
-        ));
-        assert!(!process_is_busy(
-            "/usr/local/bin/aiClean run codex",
-            Provider::Codex
-        ));
+            "/usr/local/bin/aiClean run claude codex",
+        ] {
+            for selected in [Provider::Claude, Provider::Codex] {
+                assert!(
+                    !process_is_busy(command, selected),
+                    "{command}: {selected:?}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn windows_inventory_scopes_known_and_unknown_processes() {
+        for (name, command, owner) in [
+            ("codex.exe", None, Provider::Codex),
+            ("claude.exe", None, Provider::Claude),
+            (
+                "node.exe",
+                Some("node /opt/@openai/codex/bin/codex.js"),
+                Provider::Codex,
+            ),
+            (
+                "node.exe",
+                Some("node /opt/@anthropic-ai/claude-code/cli.js"),
+                Provider::Claude,
+            ),
+        ] {
+            let inventory =
+                json!({"helper_pid":42,"processes":[{"pid":43,"name":name,"command":command}]})
+                    .to_string();
+            for selected in [Provider::Claude, Provider::Codex] {
+                assert_eq!(
+                    windows_inventory_busy(&inventory, selected).unwrap(),
+                    owner == selected,
+                    "{name}: {selected:?}"
+                );
+            }
+        }
+        for name in ["node.exe", "electron.exe"] {
+            let inventory =
+                json!({"helper_pid":42,"processes":[{"pid":43,"name":name,"command":null}]})
+                    .to_string();
+            for selected in [Provider::Claude, Provider::Codex] {
+                assert!(windows_inventory_busy(&inventory, selected).unwrap());
+            }
+        }
     }
     #[test]
     fn original_metadata_matches_renamed_trash_entry() {

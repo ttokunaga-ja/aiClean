@@ -1,6 +1,45 @@
 use std::{fs, process::Command};
 
 #[test]
+fn check_and_status_do_not_require_or_report_os_automatic_purge_settings() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let claude = base.join("claude");
+    let codex = base.join("codex");
+    let state = base.join("state");
+    fs::create_dir(&claude).unwrap();
+    fs::create_dir(&codex).unwrap();
+    for command in ["check", "status"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_aiClean"))
+            .env("CLAUDE_CONFIG_DIR", &claude)
+            .env("CODEX_HOME", &codex)
+            .env("AICLEAN_STATE_DIR", &state)
+            .args([command, "claude", "codex"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for policy in ["30日", "自動削除", "Storage Sense", "trash_purge", "purge"] {
+            assert!(
+                !text.contains(policy),
+                "{command} exposes OS purge policy: {text}"
+            );
+        }
+        assert!(!state.exists());
+        assert_eq!(fs::read_dir(&claude).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&codex).unwrap().count(), 0);
+    }
+}
+
+#[test]
 fn check_both_providers_is_read_only_and_requires_explicit_targets() {
     let temp = tempfile::tempdir().unwrap();
     let base = temp.path().canonicalize().unwrap();
