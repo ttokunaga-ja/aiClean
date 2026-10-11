@@ -180,7 +180,7 @@ pub fn ensure_quiet(provider: Provider) -> Result<()> {
     #[cfg(target_os = "macos")]
     let output = run_command(
         "/bin/ps",
-        &["-ww".into(), "-axo".into(), "pid=,comm=,args=".into()],
+        &["-ww".into(), "-axo".into(), "pid=,stat=,comm=,args=".into()],
         &[],
     )?;
     #[cfg(target_os = "windows")]
@@ -205,7 +205,23 @@ pub fn ensure_quiet(provider: Provider) -> Result<()> {
         #[cfg(target_os = "macos")]
         for line in output.stdout.lines().filter(|line| !line.trim().is_empty()) {
             #[cfg(target_os = "macos")]
-            let command = match process_command(line, std::process::id())? {
+            let (pid, rest) = line
+                .trim()
+                .split_once(char::is_whitespace)
+                .context("Process inventory PID missing")?;
+            #[cfg(target_os = "macos")]
+            let (state, command) = rest
+                .trim()
+                .split_once(char::is_whitespace)
+                .context("Process inventory state missing")?;
+            #[cfg(target_os = "macos")]
+            if state.starts_with('Z') {
+                continue;
+            }
+            #[cfg(target_os = "macos")]
+            let live_line = format!("{pid} {}", command.trim());
+            #[cfg(target_os = "macos")]
+            let command = match process_command(&live_line, std::process::id())? {
                 Some(command) => command,
                 None => continue,
             };

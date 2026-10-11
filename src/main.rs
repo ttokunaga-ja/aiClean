@@ -195,7 +195,7 @@ fn execute(cli: &Cli) -> Result<(Value, bool)> {
                             "Cleanup starts on the 10th; use check to inspect without changing data"
                         );
                     }
-                    platform::ensure_quiet(p)?;
+                    ai_clean::process_control::prepare(p, *scheduled)?;
                     let inventory = providers::inventory(p, &roots)?;
                     let (sessions, skipped) = select(&inventory, boundary);
                     let mut v = storage::run(
@@ -215,7 +215,10 @@ fn execute(cli: &Cli) -> Result<(Value, bool)> {
                 Commands::Status(_) => Ok(
                     json!({"provider":p,"command":"status","schedule":schedule::status(&state,p)?,"storage":storage::status(&roots,&state,p)?,"mutation_block_reason":platform::ensure_quiet(p).err().map(|e|format!("{e:#}")),"state_dir":state}),
                 ),
-                Commands::Undo { .. } => storage::undo(&roots, &state, p, batch),
+                Commands::Undo { .. } => {
+                    ai_clean::process_control::prepare(p, false)?;
+                    storage::undo(&roots, &state, p, batch)
+                }
                 _ => unreachable!(),
             }
         })();
